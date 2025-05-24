@@ -30,3 +30,7 @@ system-fonts = ["font-kit"]
 [[bin]]
 name = "ringboard-egui"
 path = "src/main.rs"
+
+[[bin]]
+name = "ringboard-auto-paste"
+path = "src/bin/ringboard_auto_paste.rs"

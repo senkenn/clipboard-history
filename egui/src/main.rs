@@ -5,7 +5,7 @@ use std::{
     env,
     error::Error,
     hash::BuildHasherDefault,
-    str,
+    process, str,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -323,12 +323,19 @@ fn handle_message(message: Message, State { entries, ui }: &mut State, ctx: &egu
             }
             *pending_search_token = Some(token);
         }
-        Message::Pasted => ctx.send_viewport_cmd(ViewportCommand::Close),
+        Message::Pasted => {
+            // On paste, exit with success code
+            process::exit(0);
+        }
     }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // On window close without paste, exit with error code
+        if !self.daemon && ctx.input(|i| i.viewport().close_requested()) {
+            process::exit(1);
+        }
         for message in self.responses.try_iter() {
             handle_message(message, &mut self.state, ctx);
         }
@@ -610,19 +617,22 @@ fn main_ui(
     if let Some(&id) = ui
         .input_mut(|input| {
             (0..10).find(|i| {
-                input.consume_key(Modifiers::CTRL, match i {
-                    0 => Key::Num0,
-                    1 => Key::Num1,
-                    2 => Key::Num2,
-                    3 => Key::Num3,
-                    4 => Key::Num4,
-                    5 => Key::Num5,
-                    6 => Key::Num6,
-                    7 => Key::Num7,
-                    8 => Key::Num8,
-                    9 => Key::Num9,
-                    _ => unreachable!(),
-                })
+                input.consume_key(
+                    Modifiers::CTRL,
+                    match i {
+                        0 => Key::Num0,
+                        1 => Key::Num1,
+                        2 => Key::Num2,
+                        3 => Key::Num3,
+                        4 => Key::Num4,
+                        5 => Key::Num5,
+                        6 => Key::Num6,
+                        7 => Key::Num7,
+                        8 => Key::Num8,
+                        9 => Key::Num9,
+                        _ => unreachable!(),
+                    },
+                )
             })
         })
         .and_then(|idx| fast_paste_buffer.get(idx))
@@ -1109,33 +1119,42 @@ mod system_fonts {
 
     pub fn add_system_fonts(fonts: &mut FontDefinitions) {
         const SYSTEM_FONTS: &[(&str, &[&str])] = &[
-            ("japanese", &[
-                "Noto Sans JP",
-                "Noto Sans CJK JP",
-                "Source Han Sans JP",
-                "MS Gothic",
-            ]),
+            (
+                "japanese",
+                &[
+                    "Noto Sans JP",
+                    "Noto Sans CJK JP",
+                    "Source Han Sans JP",
+                    "MS Gothic",
+                ],
+            ),
             ("korean", &["Source Han Sans KR"]),
             ("taiwanese", &["Source Han Sans TW"]),
-            ("simplified_chinese", &[
-                "Heiti SC",
-                "Songti SC",
-                "Noto Sans CJK SC",
-                "Noto Sans SC",
-                "WenQuanYi Zen Hei",
-                "SimSun",
-                "Noto Sans SC",
-                "PingFang SC",
-                "Source Han Sans CN",
-            ]),
+            (
+                "simplified_chinese",
+                &[
+                    "Heiti SC",
+                    "Songti SC",
+                    "Noto Sans CJK SC",
+                    "Noto Sans SC",
+                    "WenQuanYi Zen Hei",
+                    "SimSun",
+                    "Noto Sans SC",
+                    "PingFang SC",
+                    "Source Han Sans CN",
+                ],
+            ),
             ("traditional_chinese", &["Source Han Sans HK"]),
-            ("arabic_fonts", &[
-                "Noto Sans Arabic",
-                "Amiri",
-                "Lateef",
-                "Al Tarikh",
-                "Segoe UI",
-            ]),
+            (
+                "arabic_fonts",
+                &[
+                    "Noto Sans Arabic",
+                    "Amiri",
+                    "Lateef",
+                    "Al Tarikh",
+                    "Segoe UI",
+                ],
+            ),
         ];
 
         let system_source = SystemSource::new();
