@@ -13,27 +13,34 @@ const RINGBOARD_COMMAND: &str = "../target/release/ringboard-egui";
 const RINGBOARD_DIR: &str = "/home/senken/senkenn/clipboard-history/egui";
 
 fn simulate_ctrl_v() -> bool {
-    // Check if `xdotool` is installed
+    // Check if `ydotool` is installed
     if !Command::new("which")
-        .arg("xdotool")
+        .arg("ydotool")
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
     {
-        eprintln!("Error: `xdotool` is not installed.");
+        eprintln!("Error: `ydotool` is not installed.");
         eprintln!("On Linux, install it using:");
-        eprintln!("  sudo apt update && sudo apt install xdotool  (Debian/Ubuntu)");
-        eprintln!("  sudo dnf install xdotool  (Fedora)");
-        eprintln!("  sudo pacman -S xdotool  (Arch Linux)");
+        eprintln!("  sudo apt update && sudo apt install ydotool  (Debian/Ubuntu)");
+        eprintln!("  sudo dnf install ydotool  (Fedora)");
+        eprintln!("  sudo pacman -S ydotool  (Arch Linux)");
         return false;
     }
-    match Command::new("xdotool").args(&["key", "control+v"]).status() {
+
+    // Simulate Ctrl+V key presses using ydotool
+    // Key codes: 29 = Ctrl, 47 = V
+    // Sequence: 29:1 (Ctrl down), 47:1 (V down), 47:0 (V up), 29:0 (Ctrl up)
+    match Command::new("ydotool")
+        .args(&["key", "29:1", "47:1", "47:0", "29:0"])
+        .status()
+    {
         Ok(status) if status.success() => {
             println!("Simulated Ctrl+V successfully.");
             true
         }
         Ok(status) => {
-            eprintln!("Error executing `xdotool`. Status: {:?}", status);
+            eprintln!("Error executing `ydotool`. Status: {:?}", status);
             false
         }
         Err(e) => {
