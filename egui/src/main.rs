@@ -1,10 +1,13 @@
+#![feature(exitcode_exit_method)]
 #![allow(clippy::significant_drop_tightening)]
 
 use std::{
     collections::HashSet,
     env,
     error::Error,
+    ffi::OsStr,
     hash::BuildHasherDefault,
+    io::BufReader,
     process, str,
     sync::{
         Arc,
@@ -19,29 +22,33 @@ use arrayvec::ArrayVec;
 use eframe::{
     egui,
     egui::{
-        CentralPanel, Event, FontId, Frame, Image, Key, Label, Margin, Modifiers,
+        CentralPanel, Event, FontId, Frame, Image, Key, Label, Margin, Modifiers, Popup,
         PopupCloseBehavior, Pos2, Response, RichText, ScrollArea, Sense, Stroke, TextEdit,
         TextFormat, ThemePreference, TopBottomPanel, Ui, Vec2, ViewportBuilder, ViewportCommand,
         Widget,
         text::{LayoutJob, LayoutSection},
     },
 };
+use image::ImageReader;
 use itoa::Integer;
 use ringboard_sdk::{
     ClientError,
-    core::{Error as CoreError, protocol::RingKind},
-    search::CancellationToken,
+    core::{Error as CoreError, IoErr, protocol::RingKind},
+    search::{CancellationTokenSink, cancellation_token},
     ui_actor::{
         Command, CommandError, DetailedEntry, Message, SearchKind, UiEntry, UiEntryCache,
         controller,
     },
 };
 use rustc_hash::FxHasher;
-use rustix::fs::unlink;
+use rustix::{
+    fs::unlink,
+    process::{getpriority_process, setpriority_process},
+};
 
 use crate::{
     loader::RingboardLoader,
-    startup::{maintain_single_instance, sleep_file_name},
+    startup::{maintain_single_instance, maybe_open_existing_instance_and_exit, sleep_file_name},
 };
 
 mod startup;
@@ -52,6 +59,12 @@ static GLOBAL: tracy_client::ProfiledAllocator<std::alloc::System> =
     tracy_client::ProfiledAllocator::new(std::alloc::System, 100);
 
 fn main() -> Result<(), eframe::Error> {
+    if env::args_os().nth(1).as_deref() == Some(OsStr::new("toggle")) {
+        let _ = maybe_open_existing_instance_and_exit().inspect_err(|e| {
+            eprintln!("Failed to check for existing instance: {e}\nDetails: {e:#?}");
+        });
+    }
+
     let stop = Arc::new(AtomicBool::new(false));
     let result = eframe::run_native(
         concat!("Ringboard v", env!("CARGO_PKG_VERSION")),
@@ -79,7 +92,34 @@ fn main() -> Result<(), eframe::Error> {
 
                     controller(&command_receiver, |m| {
                         let r = if let Message::LoadedImage { id, image } = m {
-                            ringboard_loader.add(id, image);
+                            let ringboard_loader = ringboard_loader.clone();
+                            let response_sender = response_sender.clone();
+                            thread::spawn(move || {
+                                let run = || {
+                                    let priority = getpriority_process(None).map_io_err(
+                                        || "Failed to get image loading thread priority",
+                                    )?;
+                                    let priority = priority + 1;
+                                    setpriority_process(None, priority).map_io_err(|| {
+                                        format!(
+                                            "Failed to lower image loading thread priority to \
+                                             {priority}."
+                                        )
+                                    })?;
+                                    Ok(ImageReader::new(BufReader::new(image))
+                                        .with_guessed_format()
+                                        .map_io_err(|| {
+                                            format!("Failed to guess image format for entry {id}.")
+                                        })?
+                                        .decode()?)
+                                };
+                                match run() {
+                                    Ok(image) => ringboard_loader.add(id, image),
+                                    Err(e) => {
+                                        let _ = response_sender.send(Message::Error(e));
+                                    }
+                                }
+                            });
                             Ok(())
                         } else {
                             response_sender.send(m)
@@ -122,8 +162,9 @@ fn main() -> Result<(), eframe::Error> {
     stop.store(true, Ordering::Relaxed);
     {
         let sleep_file = sleep_file_name();
-        let _ = unlink(&sleep_file)
-            .inspect_err(|e| eprintln!("Failed to delete sleep file: {sleep_file:?}\nError: {e}"));
+        let _ = unlink(&sleep_file).inspect_err(|e| {
+            eprintln!("Failed to delete sleep file: {sleep_file:?}\nError: {e}\nDetails: {e:#?}");
+        });
     }
 
     result
@@ -161,8 +202,7 @@ struct UiState {
     query: String,
     search_highlighted_id: Option<u64>,
     search_kind: SearchKind,
-    pending_search_token: Option<CancellationToken>,
-    queued_searches: u32,
+    pending_search_token: Option<CancellationTokenSink>,
 
     was_focused: bool,
     skip_first_focus: bool,
@@ -269,7 +309,6 @@ fn handle_message(message: Message, State { entries, ui }: &mut State, ctx: &egu
         search_highlighted_id,
         search_kind: _,
         pending_search_token,
-        queued_searches,
         was_focused: _,
         skip_first_focus: _,
         uri_buf,
@@ -284,12 +323,11 @@ fn handle_message(message: Message, State { entries, ui }: &mut State, ctx: &egu
         );
     };
 
-    last_error.take();
     match message {
         Message::FatalDbOpen(e) => *fatal_error = Some(e.into()),
         Message::Error(e) => {
             *last_error = Some(e);
-            *queued_searches = queued_searches.saturating_sub(1);
+            pending_search_token.take_if(|token| token.is_done());
         }
         Message::LoadedFirstPage {
             entries,
@@ -307,12 +345,10 @@ fn handle_message(message: Message, State { entries, ui }: &mut State, ctx: &egu
             }
         }
         Message::SearchResults(entries) => {
+            pending_search_token.take_if(|token| token.is_done());
             remove_old_images(entries.iter().chain(&*loaded_entries));
-            *queued_searches = queued_searches.saturating_sub(1);
-            if pending_search_token.take().is_some() {
-                *search_highlighted_id = entries.first().map(|e| e.entry.id());
-                *search_results = entries;
-            }
+            *search_highlighted_id = entries.first().map(|e| e.entry.id());
+            *search_results = entries;
         }
         Message::FavoriteChange(id) => *active_highlighted_id!(ui) = Some(id),
         Message::Deleted(_) => {}
@@ -395,9 +431,9 @@ fn search_ui(
                 ref mut search_kind,
                 ref mut search_highlighted_id,
                 ref mut pending_search_token,
-                ref mut queued_searches,
                 ref was_focused,
                 ref mut uri_buf,
+                ref mut last_error,
                 ..
             },
     }: &mut State,
@@ -405,18 +441,8 @@ fn search_ui(
     up_pressed: bool,
     down_pressed: bool,
 ) {
-    macro_rules! search {
-        () => {
-            if let Some(token) = pending_search_token {
-                token.cancel();
-            }
-            let _ = requests.send(Command::Search {
-                query: query.clone().into(),
-                kind: *search_kind,
-            });
-            *queued_searches += 1;
-        };
-    }
+    #[allow(clippy::useless_let_if_seq)]
+    let mut search_changed = false;
 
     if ui.input_mut(|i| i.consume_key(Modifiers::ALT, Key::X)) {
         *search_kind = match search_kind {
@@ -424,7 +450,7 @@ fn search_ui(
             SearchKind::Plain | SearchKind::Mime => SearchKind::Regex,
         };
         ui.input_mut(|i| i.events.retain(|e| !matches!(e, Event::Text(_))));
-        search!();
+        search_changed = true;
     }
     if ui.input_mut(|i| i.consume_key(Modifiers::ALT, Key::M)) {
         *search_kind = match search_kind {
@@ -432,7 +458,7 @@ fn search_ui(
             SearchKind::Plain | SearchKind::Regex => SearchKind::Mime,
         };
         ui.input_mut(|i| i.events.retain(|e| !matches!(e, Event::Text(_))));
-        search!();
+        search_changed = true;
     }
 
     let response = ui.add(
@@ -462,27 +488,28 @@ fn search_ui(
         *query = String::new();
         *search_results = Box::default();
         *search_highlighted_id = None;
+        *last_error = None;
     };
 
-    if ui.input(|input| input.key_pressed(Key::Escape)) && ui.memory(|mem| !mem.any_popup_open()) {
+    if ui.input(|input| input.key_pressed(Key::Escape)) && !Popup::is_any_open(ui.ctx()) {
         if query.is_empty() {
             ui.ctx().send_viewport_cmd(ViewportCommand::Close);
-        } else {
-            reset(query);
+            return;
         }
+        reset(query);
     }
     if up_pressed || down_pressed {
         response.surrender_focus();
     }
     if ui.input(|input| input.key_pressed(Key::Slash)) {
-        ui.memory_mut(egui::Memory::close_popup);
+        Popup::close_all(ui.ctx());
         response.request_focus();
     }
     if !was_focused && ui.input(|i| i.focused) {
         response.request_focus();
     }
 
-    if !response.changed() {
+    if !search_changed && !response.changed() {
         return;
     }
     if query.is_empty() {
@@ -490,7 +517,14 @@ fn search_ui(
         return;
     }
 
-    search!();
+    *last_error = None;
+    let (source, sink) = cancellation_token();
+    let _ = requests.send(Command::Search {
+        query: query.clone().into(),
+        kind: *search_kind,
+        token: source,
+    });
+    *pending_search_token = Some(sink);
 }
 
 fn show_error(ui: &mut Ui, e: &dyn Error) {
@@ -507,16 +541,16 @@ fn main_ui(
 ) {
     let State { entries, ui: state } = state_;
     let refresh = |state: &mut UiState| {
+        state.last_error.take();
         let _ = requests.send(Command::LoadFirstPage);
         if !state.query.is_empty() {
-            if let Some(token) = &state.pending_search_token {
-                token.cancel();
-            }
+            let (source, sink) = cancellation_token();
             let _ = requests.send(Command::Search {
                 query: state.query.clone().into(),
                 kind: state.search_kind,
+                token: source,
             });
-            state.queued_searches += 1;
+            state.pending_search_token = Some(sink);
         }
     };
 
@@ -547,11 +581,11 @@ fn main_ui(
             *state_ = State::default();
             state_.ui.was_focused = was_focused;
         }
-        ui.memory_mut(egui::Memory::close_popup);
+        Popup::close_all(ui.ctx());
         refresh(&mut state_.ui);
         return;
     }
-    let no_popups_open = ui.memory(|mem| !mem.any_popup_open());
+    let no_popups_open = !Popup::is_any_open(ui.ctx());
     if !active_entries!(entries, state).is_empty() && no_popups_open {
         handle_arrow_keys(
             active_entries!(entries, state),
@@ -570,10 +604,10 @@ fn main_ui(
     if active_entries!(entries, state).is_empty() {
         ui.centered_and_justified(|ui| {
             ui.label(
-                RichText::new(if state.queued_searches > 0 {
+                RichText::new(if state.pending_search_token.is_some() {
                     "Loading…"
                 } else {
-                    "Nothing to see here…"
+                    "Nothing to see here"
                 })
                 .heading(),
             );
@@ -801,99 +835,96 @@ fn row_ui(
     }
     frame.paint(ui);
 
-    let popup_id = ui.make_persistent_id(entry_id);
+    let popup = Popup::menu(&response).close_behavior(PopupCloseBehavior::CloseOnClickOutside);
+    let popup_id = popup.get_id();
+
     if response.secondary_clicked() || (try_popup && *highlighted_id == Some(entry_id)) {
-        ui.memory_mut(|mem| mem.toggle_popup(popup_id));
+        Popup::toggle_id(ui.ctx(), popup_id);
     }
-    egui::popup::popup_below_widget(
-        ui,
-        popup_id,
-        &response,
-        PopupCloseBehavior::CloseOnClickOutside,
-        |ui| {
-            if state.details_requested != Some(entry_id) {
-                state.details_requested = Some(entry_id);
-                state.detailed_entry = None;
-                let _ = requests.send(Command::GetDetails {
-                    id: entry_id,
-                    with_text: cache.is_text(),
-                });
-            }
 
-            ui.set_max_width(frame.content_ui.available_width());
-            ui.set_max_height(max_popup_height);
-
-            ui.horizontal(|ui| {
-                let mut run = |ui: &mut Ui, command| {
-                    let _ = requests.send(command);
-                    refresh(state);
-                    ui.memory_mut(egui::Memory::close_popup);
-                };
-
-                match entry.ring() {
-                    RingKind::Favorites => {
-                        if ui.button("Unfavorite").clicked() {
-                            run(ui, Command::Unfavorite(entry_id));
-                        }
-                    }
-                    RingKind::Main => {
-                        if ui.button("Favorite").clicked() {
-                            run(ui, Command::Favorite(entry_id));
-                        }
-                    }
-                }
-                if ui.button("Delete").clicked() {
-                    run(ui, Command::Delete(entry_id));
-
-                    let entries = active_entries!(entries, state);
-                    *active_highlighted_id!(state) = entries
-                        .get(index.saturating_add(1))
-                        .or_else(|| entries.get(index.saturating_sub(1)))
-                        .map(|e| e.entry.id());
-                }
+    popup.show(|ui| {
+        if state.details_requested != Some(entry_id) {
+            state.details_requested = Some(entry_id);
+            state.detailed_entry = None;
+            let _ = requests.send(Command::GetDetails {
+                id: entry_id,
+                with_text: cache.is_text(),
             });
-            ui.separator();
+        }
 
-            ui.label(format!("Id: {entry_id}"));
-            match &state.detailed_entry {
-                None => {
-                    ui.separator();
-                    ui.label("Loading…");
-                }
-                Some(Ok(DetailedEntry {
-                    mime_type,
-                    full_text,
-                })) => {
-                    if !mime_type.is_empty() {
-                        ui.label(format!("Mime type: {mime_type}"));
-                    }
-                    ui.separator();
-                    if let Some(full) = full_text {
-                        ScrollArea::both()
-                            .auto_shrink([false, true])
-                            .show(ui, |ui| {
-                                ui.label(RichText::new(&**full).monospace());
-                            });
-                    } else if matches!(cache, UiEntryCache::Image) {
-                        ScrollArea::vertical()
-                            .auto_shrink([false, true])
-                            .show(ui, |ui| {
-                                ui.add(
-                                    Image::new(state.uri_buf.format(entry.id()))
-                                        .max_width(ui.available_width())
-                                        .fit_to_original_size(1.),
-                                );
-                            });
-                    } else {
-                        ui.label("Binary data.");
+        ui.set_max_width(frame.content_ui.available_width() - frame.frame.inner_margin.rightf());
+        ui.set_max_height(max_popup_height);
+
+        ui.horizontal(|ui| {
+            let mut run = |ui: &mut Ui, command| {
+                let _ = requests.send(command);
+                refresh(state);
+                Popup::close_id(ui.ctx(), popup_id);
+            };
+
+            match entry.ring() {
+                RingKind::Favorites => {
+                    if ui.button("Unfavorite").clicked() {
+                        run(ui, Command::Unfavorite(entry_id));
                     }
                 }
-                Some(Err(e)) => {
-                    ui.label(format!("Failed to get entry details:\n{e}"));
+                RingKind::Main => {
+                    if ui.button("Favorite").clicked() {
+                        run(ui, Command::Favorite(entry_id));
+                    }
                 }
             }
-        },
-    );
+            if ui.button("Delete").clicked() {
+                run(ui, Command::Delete(entry_id));
+
+                let entries = active_entries!(entries, state);
+                *active_highlighted_id!(state) = entries
+                    .get(index.saturating_add(1))
+                    .or_else(|| entries.get(index.saturating_sub(1)))
+                    .map(|e| e.entry.id());
+            }
+        });
+        ui.separator();
+
+        ui.label(format!("Id: {entry_id}"));
+        match &state.detailed_entry {
+            None => {
+                ui.separator();
+                ui.label("Loading…");
+            }
+            Some(Ok(DetailedEntry {
+                mime_type,
+                full_text,
+            })) => {
+                if !mime_type.is_empty() {
+                    ui.label(format!("Mime type: {mime_type}"));
+                }
+                ui.separator();
+                if let Some(full) = full_text {
+                    ScrollArea::both()
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(&**full).monospace());
+                        });
+                } else if matches!(cache, UiEntryCache::Image) {
+                    ScrollArea::vertical()
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.add(
+                                Image::new(state.uri_buf.format(entry.id()))
+                                    .max_width(ui.available_width())
+                                    .fit_to_original_size(1.),
+                            );
+                        });
+                } else {
+                    ui.label("Binary data.");
+                }
+            }
+            Some(Err(e)) => {
+                ui.label(format!("Failed to get entry details:\n{e}Details: {e:#?}"));
+            }
+        }
+    });
     response
 }
 
@@ -978,18 +1009,20 @@ mod loader {
         }
 
         pub fn add(&self, id: u64, image: DynamicImage) {
-            let size = [image.width() as _, image.height() as _];
-            let image_buffer = image.into_rgba8();
-            let pixels = image_buffer.into_flat_samples();
+            let key = RingAndIndex::from_id(id).unwrap();
+            let value = {
+                let size = [image.width() as _, image.height() as _];
+                let image_buffer = image.into_rgba8();
+                let pixels = image_buffer.into_flat_samples();
+                CachedImage::Computed(
+                    ColorImage::from_rgba_unmultiplied(size, pixels.as_slice()).into(),
+                )
+            };
+
             let Ok(mut cache) = self.cache.lock() else {
                 return;
             };
-            cache.insert(
-                RingAndIndex::from_id(id).unwrap(),
-                CachedImage::Computed(
-                    ColorImage::from_rgba_unmultiplied(size, pixels.as_slice()).into(),
-                ),
-            );
+            cache.insert(key, value);
         }
     }
 

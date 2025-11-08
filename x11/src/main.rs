@@ -20,7 +20,7 @@ use error_stack::Report;
 use log::{debug, error, info, trace, warn};
 use ringboard_sdk::{
     api::{AddRequest, MoveToFrontRequest, PasteCommand, connect_to_server},
-    config::{X11Config, X11V1Config, x11_config_file},
+    config,
     core::{
         Error, IoErr, create_tmp_file,
         dirs::{paste_socket_file, socket_file},
@@ -31,11 +31,11 @@ use ringboard_sdk::{
         ring::Mmap,
     },
     is_text_mime,
-};
-use ringboard_watcher_utils::{
-    best_target::BestMimeTypeFinder,
-    deduplication::{CopyData, CopyDeduplication},
-    utils::read_paste_command,
+    watcher_utils::{
+        best_target::BestMimeTypeFinder,
+        deduplication::{CopyData, CopyDeduplication},
+        utils::read_paste_command,
+    },
 };
 use rustix::{
     event::epoll,
@@ -246,19 +246,17 @@ enum PasteFile {
     Large(Rc<Mmap>),
 }
 
-fn load_config() -> Result<X11V1Config, CliError> {
-    let path = x11_config_file();
+fn load_config() -> Result<config::x11::Latest, CliError> {
+    let path = config::x11::file();
     let mut file = match File::open(&path) {
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(X11V1Config::default()),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(config::x11::Latest::default()),
         r => r.map_io_err(|| format!("Failed to open file: {path:?}"))?,
     };
 
     let mut config = String::new();
     file.read_to_string(&mut config)
         .map_io_err(|| format!("Failed to read config: {path:?}"))?;
-    Ok(match toml::from_str::<X11Config>(&config)? {
-        X11Config::V1(c) => c,
-    })
+    Ok(toml::from_str::<config::x11::Config>(&config)?.to_latest())
 }
 
 fn run() -> Result<(), CliError> {
@@ -267,7 +265,10 @@ fn run() -> Result<(), CliError> {
         env!("CARGO_PKG_VERSION")
     );
 
-    let ref config @ X11V1Config { auto_paste } = load_config()?;
+    let ref config @ config::x11::Latest {
+        auto_paste,
+        fast_path_optimizations,
+    } = load_config()?;
     info!("Using configuration {config:?}");
 
     let server = {
@@ -401,6 +402,7 @@ fn run() -> Result<(), CliError> {
                 &mut allocator,
                 &server,
                 &mut deduplicator,
+                fast_path_optimizations,
                 paste_window,
                 root,
                 paste_timer.as_ref(),
@@ -455,6 +457,7 @@ fn handle_x11_event(
     allocator: &mut TransferAtomAllocator,
     server: impl AsFd,
     deduplicator: &mut CopyDeduplication,
+    fast_path_optimizations: bool,
 
     paste_window: Window,
     root: Window,
@@ -717,13 +720,23 @@ fn handle_x11_event(
 
             info!("Selection notification received.");
             let (state, transfer_window, transfer_atom) = allocator.alloc();
-            *state = State::FastPathPendingSelection;
+            *state = if fast_path_optimizations {
+                State::FastPathPendingSelection
+            } else {
+                State::TargetsRequest {
+                    allow_plain_text: true,
+                }
+            };
             trace!("Initialized transfer state for atom {transfer_atom}: {state:?}");
 
             conn.convert_selection(
                 transfer_window,
                 event.selection,
-                utf8_string_atom,
+                if fast_path_optimizations {
+                    utf8_string_atom
+                } else {
+                    targets_atom
+                },
                 transfer_atom,
                 x11rb::CURRENT_TIME,
             )?;

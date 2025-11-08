@@ -62,6 +62,9 @@ Options:
   -i, --ignore-case
           Ignore ASCII casing when searching
 
+      --json
+          Output JSON
+
   -h, --help
           Print help (use `-h` for a summary)
 
@@ -239,8 +242,9 @@ Modify app settings
 Usage: clipboard-history configure <COMMAND>
 
 Commands:
-  x11   Edit the X11 watcher settings
-  help  Print this message or the help of the given subcommand(s)
+  x11      Edit the X11 watcher settings
+  wayland  Edit the Wayland watcher settings
+  help     Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help
@@ -257,7 +261,20 @@ Options:
           Instead of simply placing selected items in the clipboard, attempt to automatically paste
           the selected item into the previously focused application
           
-          [default: true]
+          [possible values: true, false]
+
+      --fast-path-optimizations <FAST_PATH_OPTIMIZATIONS>
+          Disable this option to support blocking passwords from password managers that support the
+          `x-kde-passwordManagerHint` mime type.
+          
+          ### Technical details
+          
+          In X11, it is possible to ask applications for their selection with a mime type before
+          knowing if the selection is available in that format. Since the majority of clipboard
+          entries are expected to be text based, Ringboard skips a round trip with the application
+          by immediately asking for a plain text mime type selection. Only if this request fails
+          will Ringboard ask the application for the supported mime types on its selection.
+          
           [possible values: true, false]
 
   -h, --help
@@ -265,25 +282,19 @@ Options:
 
 ---
 
-Print this message or the help of the given subcommand(s)
+Edit the Wayland watcher settings
 
-Usage: clipboard-history configure help [COMMAND]
+Usage: clipboard-history configure wayland [OPTIONS]
 
-Commands:
-  x11   Edit the X11 watcher settings
-  help  Print this message or the help of the given subcommand(s)
+Options:
+      --auto-paste <AUTO_PASTE>
+          Instead of simply placing selected items in the clipboard, attempt to automatically paste
+          the selected item into the previously focused application
+          
+          [possible values: true, false]
 
----
-
-Edit the X11 watcher settings
-
-Usage: clipboard-history configure help x11
-
----
-
-Print this message or the help of the given subcommand(s)
-
-Usage: clipboard-history configure help help
+  -h, --help
+          Print help (use `-h` for a summary)
 
 ---
 
@@ -388,191 +399,3 @@ Options:
 
   -h, --help
           Print help (use `-h` for a summary)
-
----
-
-Print this message or the help of the given subcommand(s)
-
-Usage: clipboard-history debug help [COMMAND]
-
-Commands:
-  stats     Print statistics about the Ringboard database
-  dump      Dump the database contents for analysis
-  generate  Generate a pseudo-random database for testing and performance tuning purposes
-  fuzz      Spam the server with random commands
-  help      Print this message or the help of the given subcommand(s)
-
----
-
-Print statistics about the Ringboard database
-
-Usage: clipboard-history debug help stats
-
----
-
-Dump the database contents for analysis
-
-Usage: clipboard-history debug help dump
-
----
-
-Generate a pseudo-random database for testing and performance tuning purposes
-
-Usage: clipboard-history debug help generate
-
----
-
-Spam the server with random commands
-
-Usage: clipboard-history debug help fuzz
-
----
-
-Print this message or the help of the given subcommand(s)
-
-Usage: clipboard-history debug help help
-
----
-
-Print this message or the help of the given subcommand(s)
-
-Usage: clipboard-history help [COMMAND]
-
-Commands:
-  get              Get an entry from the database
-  search           Searches the Ringboard database for entries matching a query
-  add              Add an entry to the database
-  favorite         Favorite an entry
-  unfavorite       Unfavorite an entry
-  move-to-front    Move an entry to the front, making it the most recent entry
-  swap             Swap the positions of two entries
-  remove           Delete an entry from the database
-  wipe             Wipe the entire database
-  import           Migrate from other clipboard managers to Ringboard
-  garbage-collect  Run garbage collection on the database
-  configure        Modify app settings
-  debug            Debugging tools for developers
-  help             Print this message or the help of the given subcommand(s)
-
----
-
-Get an entry from the database
-
-Usage: clipboard-history help get
-
----
-
-Searches the Ringboard database for entries matching a query
-
-Usage: clipboard-history help search
-
----
-
-Add an entry to the database
-
-Usage: clipboard-history help add
-
----
-
-Favorite an entry
-
-Usage: clipboard-history help favorite
-
----
-
-Unfavorite an entry
-
-Usage: clipboard-history help unfavorite
-
----
-
-Move an entry to the front, making it the most recent entry
-
-Usage: clipboard-history help move-to-front
-
----
-
-Swap the positions of two entries
-
-Usage: clipboard-history help swap
-
----
-
-Delete an entry from the database
-
-Usage: clipboard-history help remove
-
----
-
-Wipe the entire database
-
-Usage: clipboard-history help wipe
-
----
-
-Migrate from other clipboard managers to Ringboard
-
-Usage: clipboard-history help import
-
----
-
-Run garbage collection on the database
-
-Usage: clipboard-history help garbage-collect
-
----
-
-Modify app settings
-
-Usage: clipboard-history help configure [COMMAND]
-
-Commands:
-  x11  Edit the X11 watcher settings
-
----
-
-Edit the X11 watcher settings
-
-Usage: clipboard-history help configure x11
-
----
-
-Debugging tools for developers
-
-Usage: clipboard-history help debug [COMMAND]
-
-Commands:
-  stats     Print statistics about the Ringboard database
-  dump      Dump the database contents for analysis
-  generate  Generate a pseudo-random database for testing and performance tuning purposes
-  fuzz      Spam the server with random commands
-
----
-
-Print statistics about the Ringboard database
-
-Usage: clipboard-history help debug stats
-
----
-
-Dump the database contents for analysis
-
-Usage: clipboard-history help debug dump
-
----
-
-Generate a pseudo-random database for testing and performance tuning purposes
-
-Usage: clipboard-history help debug generate
-
----
-
-Spam the server with random commands
-
-Usage: clipboard-history help debug fuzz
-
----
-
-Print this message or the help of the given subcommand(s)
-
-Usage: clipboard-history help help

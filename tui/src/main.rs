@@ -4,7 +4,7 @@ use std::{
     fmt::Write,
     fs::File,
     io,
-    io::BufWriter,
+    io::{BufReader, BufWriter},
     mem::ManuallyDrop,
     os::fd::FromRawFd,
     sync::{
@@ -14,6 +14,7 @@ use std::{
     thread,
 };
 
+use image::{DynamicImage, ImageReader};
 use ratatui::{
     Terminal,
     backend::{Backend, CrosstermBackend},
@@ -34,13 +35,16 @@ use ratatui::{
 use ratatui_image::{StatefulImage, picker::Picker, protocol::StatefulProtocol};
 use ringboard_sdk::{
     core::{Error as CoreError, IoErr, protocol::RingKind},
-    search::CancellationToken,
+    search::{CancellationTokenSink, cancellation_token},
     ui_actor::{
         Command, CommandError, DetailedEntry, Message, SearchKind, UiEntry, UiEntryCache,
         controller,
     },
 };
-use rustix::stdio::raw_stdout;
+use rustix::{
+    process::{getpriority_process, setpriority_process},
+    stdio::raw_stdout,
+};
 use thiserror::Error;
 use tui_textarea::{CursorMove, Input, Key, TextArea};
 
@@ -52,6 +56,7 @@ static GLOBAL: tracy_client::ProfiledAllocator<std::alloc::System> =
 enum Action {
     Controller(Message),
     User(io::Result<Event>),
+    ImageLoaded { id: u64, image: DynamicImage },
 }
 
 impl From<Message> for Action {
@@ -103,8 +108,7 @@ struct UiState {
         focused: true,
         kind: SearchKind::Plain,
     }),
-    pending_search_token: Option<CancellationToken>,
-    queued_searches: u32,
+    pending_search_token: Option<CancellationTokenSink>,
 
     show_help: bool,
 
@@ -222,7 +226,39 @@ impl App {
 
         thread::spawn({
             let sender = response_sender.clone();
-            move || controller(&command_receiver, |m| sender.send(m.into()))
+            move || {
+                controller(&command_receiver, |m| {
+                    if let Message::LoadedImage { id, image } = m {
+                        let sender = sender.clone();
+                        thread::spawn(move || {
+                            let run = || {
+                                let priority = getpriority_process(None)
+                                    .map_io_err(|| "Failed to get image loading thread priority")?;
+                                let priority = priority + 1;
+                                setpriority_process(None, priority).map_io_err(|| {
+                                    format!(
+                                        "Failed to lower image loading thread priority to \
+                                         {priority}."
+                                    )
+                                })?;
+                                Ok(ImageReader::new(BufReader::new(image))
+                                    .with_guessed_format()
+                                    .map_io_err(|| {
+                                        format!("Failed to guess image format for entry {id}.")
+                                    })?
+                                    .decode()?)
+                            };
+                            let _ = match run() {
+                                Ok(image) => sender.send(Action::ImageLoaded { id, image }),
+                                Err(e) => sender.send(Message::Error(e).into()),
+                            };
+                        });
+                        Ok(())
+                    } else {
+                        sender.send(m.into())
+                    }
+                });
+            }
         });
         thread::spawn(move || {
             loop {
@@ -257,7 +293,16 @@ impl App {
         for action in responses {
             if match action {
                 Action::Controller(message) => {
-                    handle_message(message, state, &mut local_state, picker, &requests)?
+                    handle_message(message, state, &mut local_state, &requests)?
+                }
+                Action::ImageLoaded { id, image } => {
+                    if let Some(ImageState::Requested(requested_id)) = state.ui.detail_image_state
+                        && requested_id == id
+                    {
+                        state.ui.detail_image_state =
+                            Some(ImageState::Loaded(picker.new_resize_protocol(image)));
+                    }
+                    false
                 }
                 Action::User(event) => handle_event(
                     event.map_io_err(|| "Failed to read terminal.")?,
@@ -301,7 +346,6 @@ fn handle_message(
     message: Message,
     State { entries, ui }: &mut State,
     pending_favorite_change: &mut Option<u64>,
-    picker: &Picker,
     requests: &Sender<Command>,
 ) -> Result<bool, CoreError> {
     let UiEntries {
@@ -314,7 +358,6 @@ fn handle_message(
         details_requested,
         detailed_entry,
         pending_search_token,
-        queued_searches,
         last_error,
         outstanding_request,
         ..
@@ -325,7 +368,7 @@ fn handle_message(
         Message::FatalDbOpen(e) => return Err(e)?,
         Message::Error(e) => {
             *last_error = Some(e);
-            *queued_searches = queued_searches.saturating_sub(1);
+            pending_search_token.take_if(|token| token.is_done());
         }
         Message::LoadedFirstPage {
             entries: new_entries,
@@ -348,14 +391,12 @@ fn handle_message(
             }
         }
         Message::SearchResults(results) => {
-            *queued_searches = queued_searches.saturating_sub(1);
-            if pending_search_token.take().is_some() {
-                *search_results = results;
-                if search_state.selected().is_none() {
-                    search_state.select_first();
-                }
-                maybe_focus_pending_changed_entry(entries, ui, pending_favorite_change);
+            pending_search_token.take_if(|token| token.is_done());
+            *search_results = results;
+            if search_state.selected().is_none() {
+                search_state.select_first();
             }
+            maybe_focus_pending_changed_entry(entries, ui, pending_favorite_change);
         }
         Message::FavoriteChange(id) => {
             *pending_favorite_change = Some(id);
@@ -364,19 +405,7 @@ fn handle_message(
         Message::Deleted(id) => {
             outstanding_request.take_if(|&mut req_id| req_id == id);
         }
-        Message::LoadedImage { id, image } => {
-            if let Some(ImageState::Requested(requested_id)) = ui.detail_image_state
-                && requested_id == id
-            {
-                ui.detail_image_state = Some(ImageState::Loaded(picker.new_resize_protocol(image)));
-            }
-        }
-        Message::PendingSearch(token) => {
-            if *queued_searches > 1 {
-                token.cancel();
-            }
-            *pending_search_token = Some(token);
-        }
+        Message::LoadedImage { .. } => unreachable!(),
         Message::Pasted => return Ok(true),
     }
     if ui.details_requested.is_some() {
@@ -408,14 +437,17 @@ fn handle_event(event: Event, state: &mut State, requests: &Sender<Command>) -> 
         ui.detailed_entry = None;
     };
     let search = |ui: &mut UiState, kind: SearchKind| {
-        if let Some(token) = &ui.pending_search_token {
-            token.cancel();
+        if ui.query.is_empty() {
+            return;
         }
+
+        let (source, sink) = cancellation_token();
         let _ = requests.send(Command::Search {
-            query: ui.query.lines().first().unwrap().to_string().into(),
+            query: ui.query.lines().first().unwrap().as_str().into(),
             kind,
+            token: source,
         });
-        ui.queued_searches += 1;
+        ui.pending_search_token = Some(sink);
     };
     let refresh = |ui: &mut UiState| {
         let _ = requests.send(Command::LoadFirstPage);
@@ -662,7 +694,7 @@ impl Widget for &mut AppWrapper<'_> {
     }
 }
 
-fn ui_entry_line(UiEntry { entry: _, cache }: &UiEntry) -> Line {
+fn ui_entry_line(UiEntry { entry: _, cache }: &UiEntry) -> Line<'_> {
     match cache {
         &UiEntryCache::HighlightedText {
             ref one_liner,
@@ -704,7 +736,7 @@ impl AppWrapper<'_> {
                     } else {
                         Style::default()
                     })
-                    .title(if ui.queued_searches > 0 {
+                    .title(if ui.pending_search_token.is_some() {
                         "Searching…"
                     } else {
                         match kind {
@@ -727,7 +759,7 @@ impl AppWrapper<'_> {
         outer_block.render(entries_area, buf);
 
         if active_entries!(entries, ui).is_empty() {
-            Line::raw("Nothing to see here…")
+            Line::raw("Nothing to see here")
                 .italic()
                 .render(inner_area, buf);
         } else {

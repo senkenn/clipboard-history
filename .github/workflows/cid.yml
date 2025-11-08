@@ -46,22 +46,18 @@ jobs:
   deploy_release:
     needs: [ build, test ]
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
     if: startsWith(github.ref, 'refs/tags/')
     steps:
       - name: Checkout
         uses: actions/checkout@v3
+      - name: Install crates.io auth token
+        uses: rust-lang/crates-io-auth-action@v1
+        id: auth
       - name: Publish release
         run: |
-          cargo publish --package clipboard-history-core
-          cargo publish --package clipboard-history-client-sdk
-          cargo publish --package clipboard-history-server
-          cargo publish --package clipboard-history
-          cargo publish --package wayland-interface-check
-          cargo publish --package clipboard-history-watcher-utils
-          cargo publish --package clipboard-history-x11
-          cargo publish --package clipboard-history-wayland
-          cargo publish --package clipboard-history-egui
-          cargo publish --package clipboard-history-tui
+          cargo publish --workspace
 
           sed -i 's/name = "clipboard-history-server"/name = "ringboard-server"/' server/Cargo.toml
           cargo publish --package ringboard-server --allow-dirty
@@ -76,7 +72,7 @@ jobs:
           sed -i 's/name = "clipboard-history-tui"/name = "ringboard-tui"/' tui/Cargo.toml
           cargo publish --package ringboard-tui --allow-dirty
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
   attach_binaries:
     strategy:

@@ -253,7 +253,7 @@ impl FreeLists {
         Ok(())
     }
 
-    fn alloc(&mut self, bucket: usize) -> Option<BucketSlotGuard> {
+    fn alloc(&mut self, bucket: usize) -> Option<BucketSlotGuard<'_>> {
         let free_list = &mut self.lists.0[bucket];
         free_list.pop().map(|id| BucketSlotGuard { id, free_list })
     }
@@ -300,7 +300,7 @@ impl Allocator {
             getxattr(
                 c"direct",
                 c"user.mime_type",
-                &mut [const { MaybeUninit::uninit() }; 0]
+                &mut ([] as [MaybeUninit<u8>; 0])
             ),
             Err(Errno::NOTSUP)
         );

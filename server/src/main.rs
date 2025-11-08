@@ -30,7 +30,7 @@ enum CliError {
     #[error("server already running at {pid:?}")]
     ServerAlreadyRunning { pid: Pid, lock_file: PathBuf },
     #[error("multiple errors occurred")]
-    Multiple(Vec<CliError>),
+    Multiple(Vec<Self>),
     #[error("internal error")]
     Internal { context: Cow<'static, str> },
 }
@@ -94,6 +94,7 @@ fn run() -> Result<(), CliError> {
 
     {
         let data_dir = data_dir();
+        let data_dir = fs::read_link(&data_dir).unwrap_or(data_dir);
         info!("Using database in {data_dir:?}.");
 
         fs::create_dir_all(&data_dir)

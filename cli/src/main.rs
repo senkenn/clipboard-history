@@ -4,6 +4,7 @@ use std::{
     borrow::Cow,
     cmp::{max, min},
     collections::{BTreeMap, HashMap, VecDeque},
+    fmt,
     fmt::{Debug, Display, Formatter},
     fs,
     fs::{File, create_dir_all},
@@ -42,7 +43,7 @@ use ringboard_sdk::{
         AddRequest, GarbageCollectRequest, MoveToFrontRequest, RemoveRequest, SwapRequest,
         connect_to_paste_server, connect_to_server, connect_to_server_with, send_paste_buffer,
     },
-    config::{X11Config, X11V1Config, x11_config_file},
+    config,
     core::{
         BucketAndIndex, Error as CoreError, IoErr, NUM_BUCKETS, SendQuitAndWait, acquire_lock_file,
         bucket_to_length, create_tmp_file,
@@ -56,7 +57,7 @@ use ringboard_sdk::{
         size_to_bucket,
     },
     duplicate_detection::DuplicateDetector,
-    search::{CaselessQuery, EntryLocation, Query, QueryResult},
+    search::{CaselessQuery, EntryLocation, Query, QueryResult, cancellation_token},
 };
 use rustc_hash::FxHasher;
 use rustix::{
@@ -168,6 +169,10 @@ enum Configure {
     /// Edit the X11 watcher settings.
     #[command(aliases = ["x"])]
     X11(ConfigureX11),
+
+    /// Edit the Wayland watcher settings.
+    #[command(aliases = ["w"])]
+    Wayland(ConfigureWayland),
 }
 
 #[derive(Args, Debug)]
@@ -176,9 +181,34 @@ struct ConfigureX11 {
     /// automatically paste the selected item into the previously focused
     /// application.
     #[clap(long)]
-    #[clap(default_value_t = true)]
     #[clap(action = ArgAction::Set)]
-    auto_paste: bool,
+    auto_paste: Option<bool>,
+
+    /// Disable this option to support blocking passwords from password managers
+    /// that support the `x-kde-passwordManagerHint` mime type.
+    ///
+    /// ### Technical details
+    ///
+    /// In X11, it is possible to ask applications for their selection with a
+    /// mime type before knowing if the selection is available in that format.
+    /// Since the majority of clipboard entries are expected to be text based,
+    /// Ringboard skips a round trip with the application by immediately asking
+    /// for a plain text mime type selection. Only if this request fails will
+    /// Ringboard ask the application for the supported mime types on its
+    /// selection.
+    #[clap(long)]
+    #[clap(action = ArgAction::Set)]
+    fast_path_optimizations: Option<bool>,
+}
+
+#[derive(Args, Debug)]
+struct ConfigureWayland {
+    /// Instead of simply placing selected items in the clipboard, attempt to
+    /// automatically paste the selected item into the previously focused
+    /// application.
+    #[clap(long)]
+    #[clap(action = ArgAction::Set)]
+    auto_paste: Option<bool>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -258,6 +288,11 @@ struct Search {
     #[arg(short, long)]
     #[arg(conflicts_with = "regex")]
     ignore_case: bool,
+
+    /// Output JSON
+    #[arg(long)]
+    #[clap(default_value_t = false)]
+    json: bool,
 
     /// The query string to search for.
     #[arg(required = true)]
@@ -467,6 +502,7 @@ fn run() -> Result<(), CliError> {
         Cmd::GarbageCollect(data) => garbage_collect(connect_to_server(&server_addr)?, data),
         Cmd::Import(data) => import(connect_to_server(&server_addr)?, data),
         Cmd::Configure(Configure::X11(data)) => configure_x11(data),
+        Cmd::Configure(Configure::Wayland(data)) => configure_wayland(data),
         Cmd::Debug(Dev::Stats) => stats(),
         Cmd::Debug(Dev::Dump) => dump(),
         Cmd::Debug(Dev::Generate(data)) => generate(connect_to_server(&server_addr)?, data),
@@ -501,54 +537,82 @@ fn search(
     Search {
         regex,
         ignore_case,
+        json,
         query,
     }: Search,
 ) -> Result<(), CliError> {
     const PREFIX_CONTEXT: usize = 40;
     const CONTEXT_WINDOW: usize = 100;
 
-    let (mut database, reader) = open_db()?;
-    let mut output = io::stdout().lock();
-    let mut print_entry = |entry_id,
-                           buf: &[u8],
-                           mime_type: &str,
-                           start: usize,
-                           end: usize|
-     -> Result<(), CoreError> {
-        writeln!(
-            output,
-            "--- ENTRY {entry_id}{} ---",
-            if mime_type.is_empty() {
-                String::new()
-            } else {
-                format!("; {mime_type}")
+    enum Output<Text: AsFd, Json: SerializeSeq> {
+        Text(Text),
+        Json(Json),
+    }
+
+    let output = io::stdout().lock();
+    let mut seq = serde_json::Serializer::new(output);
+    let mut output = if json {
+        Output::Json(seq.serialize_seq(None)?)
+    } else {
+        Output::Text(seq.into_inner())
+    };
+    let mut emit_entry = |entry_id,
+                          buf: &[u8],
+                          mime_type: MimeType,
+                          start: usize,
+                          end: usize|
+     -> Result<(), CliError> {
+        match &mut output {
+            Output::Text(output) => {
+                writeln!(
+                    output,
+                    "--- ENTRY {entry_id}{} ---",
+                    if mime_type.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; {mime_type}")
+                    }
+                )
+                .map_io_err(|| "Failed to write to stdout.")?;
+
+                let bold_start = start.min(PREFIX_CONTEXT);
+                let (prefix, suffix) = buf.split_at(bold_start);
+                let (middle, suffix) = suffix.split_at((end - start).min(suffix.len()));
+                let mut no_empty_write = |buf: &[u8]| -> Result<(), CoreError> {
+                    if !buf.is_empty() {
+                        output
+                            .write_all(buf)
+                            .map_io_err(|| "Failed to write to stdout.")?;
+                    }
+                    Ok(())
+                };
+
+                no_empty_write(prefix)?;
+                no_empty_write(b"\x1b[1m")?;
+                no_empty_write(middle)?;
+                no_empty_write(b"\x1b[0m")?;
+                no_empty_write(suffix)?;
+                no_empty_write(b"\n\n")?;
+
+                Ok(())
             }
-        )
-        .map_io_err(|| "Failed to write to stdout.")?;
-
-        let bold_start = start.min(PREFIX_CONTEXT);
-        let (prefix, suffix) = buf.split_at(bold_start);
-        let (middle, suffix) = suffix.split_at((end - start).min(suffix.len()));
-        let mut no_empty_write = |buf: &[u8]| -> Result<(), CoreError> {
-            if !buf.is_empty() {
-                output
-                    .write_all(buf)
-                    .map_io_err(|| "Failed to write to stdout.")?;
+            Output::Json(seq) => {
+                seq.serialize_element(&ExportEntry {
+                    id: entry_id,
+                    data: str::from_utf8(buf).map_or_else(
+                        |_| ExportData::Bytes(buf.into()),
+                        |data| ExportData::Human(data.into()),
+                    ),
+                    mime_type,
+                })?;
+                Ok(())
             }
-            Ok(())
-        };
-
-        no_empty_write(prefix)?;
-        no_empty_write(b"\x1b[1m")?;
-        no_empty_write(middle)?;
-        no_empty_write(b"\x1b[0m")?;
-        no_empty_write(suffix)?;
-        no_empty_write(b"\n\n")?;
-
-        Ok(())
+        }
     };
 
+    let (mut database, reader) = open_db()?;
     let reader = Arc::new(reader);
+    let (source_token, _sink_token) = cancellation_token();
     let (result_stream, threads) = {
         // TODO https://github.com/rust-lang/rust-clippy/issues/13227
         #[allow(clippy::redundant_locals)]
@@ -562,6 +626,7 @@ fn search(
                 Query::Plain(query.as_bytes())
             },
             reader.clone(),
+            source_token,
         )
     };
     let mut results = BTreeMap::<BucketAndIndex, (u16, u16)>::new();
@@ -580,18 +645,23 @@ fn search(
             }
             EntryLocation::File { entry_id } => {
                 let entry = unsafe { database.get(entry_id)? };
-                let file = entry.to_file_raw(&reader)?.unwrap();
+                if json {
+                    let bytes = entry.to_slice_raw(&reader)?.unwrap();
+                    emit_entry(entry_id, &bytes, bytes.mime_type()?, start, end)?;
+                } else {
+                    let file = entry.to_file_raw(&reader)?.unwrap();
 
-                let mut buf = [MaybeUninit::uninit(); CONTEXT_WINDOW];
-                let mut buf = BorrowedBuf::from(buf.as_mut_slice());
-                read_at_to_end(
-                    &*file,
-                    buf.unfilled(),
-                    u64::try_from(start.saturating_sub(PREFIX_CONTEXT)).unwrap(),
-                )
-                .map_io_err(|| format!("failed to read from direct entry {entry_id}."))?;
+                    let mut buf = [MaybeUninit::uninit(); CONTEXT_WINDOW];
+                    let mut buf = BorrowedBuf::from(buf.as_mut_slice());
+                    read_at_to_end(
+                        &*file,
+                        buf.unfilled(),
+                        u64::try_from(start.saturating_sub(PREFIX_CONTEXT)).unwrap(),
+                    )
+                    .map_io_err(|| format!("failed to read from direct entry {entry_id}."))?;
 
-                print_entry(entry_id, buf.filled(), &file.mime_type()?, start, end)?;
+                    emit_entry(entry_id, buf.filled(), file.mime_type()?, start, end)?;
+                }
             }
         }
     }
@@ -613,14 +683,24 @@ fn search(
         let (start, end) = (usize::from(start), usize::from(end));
 
         let bytes = entry.to_slice(&mut reader)?;
-        let prefix_start = start.saturating_sub(PREFIX_CONTEXT);
-        print_entry(
-            entry.id(),
-            &bytes[prefix_start..(prefix_start + CONTEXT_WINDOW).min(bytes.len())],
-            &bytes.mime_type()?,
-            start,
-            end,
-        )?;
+        let mime_type = bytes.mime_type()?;
+        if json {
+            emit_entry(entry.id(), &bytes, mime_type, start, end)?;
+        } else {
+            let prefix_start = start.saturating_sub(PREFIX_CONTEXT);
+            emit_entry(
+                entry.id(),
+                &bytes[prefix_start..(prefix_start + CONTEXT_WINDOW).min(bytes.len())],
+                mime_type,
+                start,
+                end,
+            )?;
+        }
+    }
+
+    match output {
+        Output::Text(_) => (),
+        Output::Json(seq) => SerializeSeq::end(seq)?,
     }
 
     Ok(())
@@ -1232,85 +1312,104 @@ fn stats() -> Result<(), CliError> {
         fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
             let mut s = f.debug_struct("Stats");
 
-            s.field_with("raw", |f| {
-                f.debug_struct("Raw")
-                    .field("rings", &self.rings)
-                    .field("buckets", &self.buckets)
-                    .field("direct_files", &self.direct_files)
-                    .finish()
-            });
-            s.field_with("computed", |f| {
-                f.debug_struct("Computed")
-                    .field_with("rings", |f| {
-                        let mut rings = f.debug_map();
-                        for (
-                            kind,
-                            &RingStats {
-                                capacity: _,
-                                len,
-                                bucketed_entry_count,
-                                file_entry_count,
-                                num_duplicates: _,
-                                min_entry_size: _,
-                                max_entry_size: _,
-                                owned_bytes,
-                            },
-                        ) in &self.rings
-                        {
-                            rings.key(kind).value_with(|f| {
-                                let num_entries = bucketed_entry_count + file_entry_count;
-                                let mut s = f.debug_struct("Ring");
-                                s.field("num_entries", &num_entries)
-                                    .field("uninitialized_entry_count", &(len - num_entries))
-                                    .field(
-                                        "mean_entry_size",
-                                        &(owned_bytes as f64 / f64::from(num_entries)),
-                                    );
-                                s.finish()
-                            });
-                        }
-                        rings.finish()
-                    })
-                    .field_with("buckets", |f| {
-                        let mut buckets = f.debug_map();
-                        for &BucketStats {
-                            size_class,
-                            num_slots,
-                            used_slots,
-                            owned_bytes,
-                        } in &self.buckets
-                        {
-                            let length = bucket_to_length(size_class - 2);
-                            let used_bytes = u64::from(length) * u64::from(used_slots);
-                            let fragmentation = used_bytes - owned_bytes;
-                            buckets.key(&length).value_with(|f| {
-                                f.debug_struct("Bucket")
-                                    .field("free_slots", &(num_slots - used_slots))
-                                    .field("fragmentation_bytes", &fragmentation)
+            s.field(
+                "raw",
+                &fmt::from_fn(|f| {
+                    f.debug_struct("Raw")
+                        .field("rings", &self.rings)
+                        .field("buckets", &self.buckets)
+                        .field("direct_files", &self.direct_files)
+                        .finish()
+                }),
+            );
+            s.field(
+                "computed",
+                &fmt::from_fn(|f| {
+                    f.debug_struct("Computed")
+                        .field(
+                            "rings",
+                            &fmt::from_fn(|f| {
+                                let mut rings = f.debug_map();
+                                for (
+                                    kind,
+                                    &RingStats {
+                                        capacity: _,
+                                        len,
+                                        bucketed_entry_count,
+                                        file_entry_count,
+                                        num_duplicates: _,
+                                        min_entry_size: _,
+                                        max_entry_size: _,
+                                        owned_bytes,
+                                    },
+                                ) in &self.rings
+                                {
+                                    rings.key(kind).value(&fmt::from_fn(|f| {
+                                        let num_entries = bucketed_entry_count + file_entry_count;
+                                        let mut s = f.debug_struct("Ring");
+                                        s.field("num_entries", &num_entries)
+                                            .field(
+                                                "uninitialized_entry_count",
+                                                &(len - num_entries),
+                                            )
+                                            .field(
+                                                "mean_entry_size",
+                                                &(owned_bytes as f64 / f64::from(num_entries)),
+                                            );
+                                        s.finish()
+                                    }));
+                                }
+                                rings.finish()
+                            }),
+                        )
+                        .field(
+                            "buckets",
+                            &fmt::from_fn(|f| {
+                                let mut buckets = f.debug_map();
+                                for &BucketStats {
+                                    size_class,
+                                    num_slots,
+                                    used_slots,
+                                    owned_bytes,
+                                } in &self.buckets
+                                {
+                                    let length = bucket_to_length(size_class - 2);
+                                    let used_bytes = u64::from(length) * u64::from(used_slots);
+                                    let fragmentation = used_bytes - owned_bytes;
+                                    buckets.key(&length).value(&fmt::from_fn(|f| {
+                                        f.debug_struct("Bucket")
+                                            .field("free_slots", &(num_slots - used_slots))
+                                            .field("fragmentation_bytes", &fragmentation)
+                                            .field(
+                                                "fragmentation_ratio",
+                                                &(fragmentation as f64 / used_bytes as f64),
+                                            )
+                                            .finish()
+                                    }));
+                                }
+                                buckets.finish()
+                            }),
+                        )
+                        .field(
+                            "direct_files",
+                            &fmt::from_fn(|f| {
+                                let &DirectFileStats {
+                                    owned_bytes,
+                                    allocated_bytes,
+                                    mime_types: _,
+                                } = &self.direct_files;
+                                f.debug_struct("DirectFiles")
                                     .field(
                                         "fragmentation_ratio",
-                                        &(fragmentation as f64 / used_bytes as f64),
+                                        &((allocated_bytes - owned_bytes) as f64
+                                            / allocated_bytes as f64),
                                     )
                                     .finish()
-                            });
-                        }
-                        buckets.finish()
-                    })
-                    .field_with("direct_files", |f| {
-                        let &DirectFileStats {
-                            owned_bytes,
-                            allocated_bytes,
-                            mime_types: _,
-                        } = &self.direct_files;
-                        f.debug_struct("DirectFiles")
-                            .field(
-                                "fragmentation_ratio",
-                                &((allocated_bytes - owned_bytes) as f64 / allocated_bytes as f64),
-                            )
-                            .finish()
-                    })
-                    .finish()
-            });
+                            }),
+                        )
+                        .finish()
+                }),
+            );
 
             s.finish()
         }
@@ -2011,15 +2110,60 @@ fn fuzz(
     }
 }
 
-fn configure_x11(ConfigureX11 { auto_paste }: ConfigureX11) -> Result<(), CliError> {
-    let path = x11_config_file();
+#[allow(clippy::needless_pass_by_value)]
+fn configure_x11(x11: ConfigureX11) -> Result<(), CliError> {
+    let path = config::x11::file();
     {
         let parent = path.parent().unwrap();
         create_dir_all(parent).map_io_err(|| format!("Failed to create dir: {parent:?}"))?;
     }
     let mut file = File::create(&path).map_io_err(|| format!("Failed to open file: {path:?}"))?;
 
-    let config = toml::to_string_pretty(&X11Config::V1(X11V1Config { auto_paste }))?;
+    let mut config = config::x11::Latest::default();
+    {
+        let ConfigureX11 {
+            auto_paste,
+            fast_path_optimizations,
+        } = x11;
+        let config::x11::Latest {
+            auto_paste: ref mut auto_paste_,
+            fast_path_optimizations: ref mut fast_path_optimizations_,
+        } = config;
+        if let Some(auto_paste) = auto_paste {
+            *auto_paste_ = auto_paste;
+        }
+        if let Some(fast_path_optimizations) = fast_path_optimizations {
+            *fast_path_optimizations_ = fast_path_optimizations;
+        }
+    }
+    let config = toml::to_string_pretty(&config::x11::Config::V1(config))?;
+    file.write_all(config.as_bytes())
+        .map_io_err(|| format!("Failed to write to config file: {path:?}"))?;
+
+    println!("Saved configuration file to {path:?}.");
+    Ok(())
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn configure_wayland(wayland: ConfigureWayland) -> Result<(), CliError> {
+    let path = config::wayland::file();
+    {
+        let parent = path.parent().unwrap();
+        create_dir_all(parent).map_io_err(|| format!("Failed to create dir: {parent:?}"))?;
+    }
+    let mut file = File::create(&path).map_io_err(|| format!("Failed to open file: {path:?}"))?;
+
+    let mut config = config::wayland::Latest::default();
+    {
+        let ConfigureWayland { auto_paste } = wayland;
+        let config::wayland::Latest {
+            auto_paste: ref mut auto_paste_,
+        } = config;
+        if let Some(auto_paste) = auto_paste {
+            *auto_paste_ = auto_paste;
+        }
+    }
+    let config = toml::to_string_pretty(&config::wayland::Config::V1(config))?;
     file.write_all(config.as_bytes())
         .map_io_err(|| format!("Failed to write to config file: {path:?}"))?;
 
